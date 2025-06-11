@@ -34,14 +34,6 @@ WORKDIR /root/
 # Copy the binary from builder stage
 COPY --from=builder /app/main .
 
-RUN chmod +x main && chown appuser:appgroup main
-
-# Change ownership to non-root user
-RUN chown appuser:appgroup main
-
-# Switch to non-root user
-USER appuser
-
 # Expose port (default is 8545, but can be overridden)
 EXPOSE 80
 
