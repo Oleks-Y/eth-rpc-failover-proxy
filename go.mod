@@ -1,4 +1,4 @@
-module eth-rpc-proxy
+module eth-rpc-failover-proxy
 
 go 1.24.4
 
