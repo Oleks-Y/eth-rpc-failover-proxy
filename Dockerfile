@@ -46,7 +46,7 @@ USER appuser
 EXPOSE 80
 
 # Environment variables with defaults
-ENV PORT=8545
+ENV PORT=80
 ENV DEBUG=false
 ENV CACHE_TIME=1
 
