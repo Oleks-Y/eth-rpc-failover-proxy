@@ -66,7 +66,7 @@ func loadConfig() *Config {
 		port = "8545"
 	}
 
-	rpcNodesStr := os.Getenv("ETHEREUM_RPC_NODES")
+	rpcNodesStr := os.Getenv("RPC_NODES")
 	if rpcNodesStr == "" {
 		rpcNodesStr = os.Getenv("ETHEREUM_RPC_NODE")
 	}
@@ -294,7 +294,7 @@ func main() {
 	config := loadConfig()
 
 	if len(config.RPCNodes) == 0 {
-		log.Fatal("No RPC nodes configured. Set ETHEREUM_RPC_NODES or ETHEREUM_RPC_NODE environment variable")
+		log.Fatal("No RPC nodes configured. Set RPC_NODES or ETHEREUM_RPC_NODE environment variable")
 	}
 
 	server := NewServer(config)
