@@ -223,7 +223,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if resp.StatusCode >= 500 {
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusUnauthorized {
 			lastErr = fmt.Errorf("RPC node returned %d status", resp.StatusCode)
 			if s.config.Debug {
 				log.Printf("RPC node %d returned %d status", i+1, resp.StatusCode)
