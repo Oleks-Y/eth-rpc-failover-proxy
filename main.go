@@ -35,9 +35,6 @@ type Config struct {
 	Debug         bool
 	CacheTTL      time.Duration
 	Port          string
-	TLSPort       string
-	TLSCertFile   string
-	TLSKeyFile    string
 	RPCNodes      []string
 	WSNodes       []string
 	DirectMethods []string
@@ -95,14 +92,6 @@ func loadConfig() *Config {
 		port = "8545"
 	}
 
-	tlsPort := os.Getenv("TLS_PORT")
-	if tlsPort == "" {
-		tlsPort = "8546"
-	}
-
-	tlsCertFile := os.Getenv("TLS_CERT_FILE")
-	tlsKeyFile := os.Getenv("TLS_KEY_FILE")
-
 	rpcNodesStr := os.Getenv("RPC_NODES")
 	if rpcNodesStr == "" {
 		rpcNodesStr = os.Getenv("ETHEREUM_RPC_NODE")
@@ -115,14 +104,6 @@ func loadConfig() *Config {
 		rpcNodes = strings.Split(rpcNodesStr, ",")
 		for i, node := range rpcNodes {
 			rpcNodes[i] = strings.TrimSpace(node)
-		}
-
-		// Generate WebSocket URLs from HTTP URLs
-		for _, node := range rpcNodes {
-			wsURL := convertHTTPToWebSocket(strings.TrimSpace(node))
-			if wsURL != "" {
-				wsNodes = append(wsNodes, wsURL)
-			}
 		}
 	}
 
@@ -141,9 +122,6 @@ func loadConfig() *Config {
 		Debug:         debug,
 		CacheTTL:      cacheTTL,
 		Port:          port,
-		TLSPort:       tlsPort,
-		TLSCertFile:   tlsCertFile,
-		TLSKeyFile:    tlsKeyFile,
 		RPCNodes:      rpcNodes,
 		WSNodes:       wsNodes,
 		DirectMethods: directMethods,
@@ -696,46 +674,16 @@ func main() {
 
 	http.HandleFunc("/", server.enableCORS)
 
-	// Check if TLS is configured
-	hasTLS := config.TLSCertFile != "" && config.TLSKeyFile != ""
+	log.Printf("Server starting on port %s with %d HTTP RPC nodes and %d WebSocket nodes",
+		config.Port, len(config.RPCNodes), len(config.WSNodes))
+	log.Printf("Note: For WSS support, configure TLS_CERT_FILE and TLS_KEY_FILE")
 
-	if hasTLS {
-		log.Printf("Server starting with TLS on port %s and HTTP on port %s", config.TLSPort, config.Port)
-		log.Printf("Clients can connect via:")
-		log.Printf("  HTTP/WS:  http://localhost:%s", config.Port)
-		log.Printf("  HTTPS/WSS: https://localhost:%s", config.TLSPort)
+	if config.Debug {
+		log.Printf("HTTP RPC nodes: %v", config.RPCNodes)
+		log.Printf("WebSocket nodes: %v", config.WSNodes)
+	}
 
-		if config.Debug {
-			log.Printf("HTTP RPC nodes: %v", config.RPCNodes)
-			log.Printf("WebSocket nodes: %v", config.WSNodes)
-			log.Printf("TLS Certificate: %s", config.TLSCertFile)
-			log.Printf("TLS Key: %s", config.TLSKeyFile)
-		}
-
-		// Start both HTTP and HTTPS servers
-		go func() {
-			log.Printf("Starting HTTP server on port %s", config.Port)
-			if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
-				log.Printf("HTTP server failed: %v", err)
-			}
-		}()
-
-		log.Printf("Starting HTTPS/WSS server on port %s", config.TLSPort)
-		if err := http.ListenAndServeTLS(":"+config.TLSPort, config.TLSCertFile, config.TLSKeyFile, nil); err != nil {
-			log.Fatal("HTTPS server failed to start:", err)
-		}
-	} else {
-		log.Printf("Server starting on port %s with %d HTTP RPC nodes and %d WebSocket nodes",
-			config.Port, len(config.RPCNodes), len(config.WSNodes))
-		log.Printf("Note: For WSS support, configure TLS_CERT_FILE and TLS_KEY_FILE")
-
-		if config.Debug {
-			log.Printf("HTTP RPC nodes: %v", config.RPCNodes)
-			log.Printf("WebSocket nodes: %v", config.WSNodes)
-		}
-
-		if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
-			log.Fatal("Server failed to start:", err)
-		}
+	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
+		log.Fatal("Server failed to start:", err)
 	}
 }
