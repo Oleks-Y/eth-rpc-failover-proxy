@@ -6,30 +6,586 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// Existing test types and helper functions
 type TestRPCRequest struct {
-	ID     int         `json:"id"`
-	Method string      `json:"method"`
-	Params interface{} `json:"params"`
+	ID      interface{} `json:"id"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params"`
 	JSONRPC string      `json:"jsonrpc"`
 }
 
 type TestRPCResponse struct {
-	ID     int         `json:"id"`
-	Result interface{} `json:"result,omitempty"`
-	Error  interface{} `json:"error,omitempty"`
+	ID      interface{} `json:"id"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   interface{} `json:"error,omitempty"`
 	JSONRPC string      `json:"jsonrpc,omitempty"`
 }
+
+// WebSocket test server for mocking backend WebSocket nodes
+type MockWSServer struct {
+	server   *httptest.Server
+	upgrader websocket.Upgrader
+	clients  map[*websocket.Conn]bool
+	mu       sync.RWMutex
+	fail     bool // Controls whether server should fail
+	messages [][]byte // Store received messages for verification
+}
+
+func NewMockWSServer() *MockWSServer {
+	mock := &MockWSServer{
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
+		clients:  make(map[*websocket.Conn]bool),
+		messages: make([][]byte, 0),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", mock.handleWebSocket)
+	mock.server = httptest.NewServer(mux)
+
+	return mock
+}
+
+func (m *MockWSServer) URL() string {
+	return "ws" + strings.TrimPrefix(m.server.URL, "http")
+}
+
+func (m *MockWSServer) Close() {
+	m.server.Close()
+}
+
+func (m *MockWSServer) SetFail(fail bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fail = fail
+}
+
+func (m *MockWSServer) GetMessages() [][]byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	messages := make([][]byte, len(m.messages))
+	copy(messages, m.messages)
+	return messages
+}
+
+func (m *MockWSServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	m.mu.RLock()
+	shouldFail := m.fail
+	m.mu.RUnlock()
+
+	if shouldFail {
+		http.Error(w, "Server unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	conn, err := m.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	m.mu.Lock()
+	m.clients[conn] = true
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		delete(m.clients, conn)
+		m.mu.Unlock()
+	}()
+
+	for {
+		messageType, message, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		// Store message for verification
+		m.mu.Lock()
+		m.messages = append(m.messages, message)
+		m.mu.Unlock()
+
+		// Handle subscription requests
+		var req TestRPCRequest
+		if json.Unmarshal(message, &req) == nil {
+			if req.Method == "eth_subscribe" {
+				// Send subscription response
+				response := TestRPCResponse{
+					ID:      req.ID,
+					Result:  "0x1234567890abcdef",
+					JSONRPC: "2.0",
+				}
+				respBytes, _ := json.Marshal(response)
+				conn.WriteMessage(messageType, respBytes)
+
+				// Send a subscription notification after a delay
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					notification := map[string]interface{}{
+						"jsonrpc": "2.0",
+						"method":  "eth_subscription",
+						"params": map[string]interface{}{
+							"subscription": "0x1234567890abcdef",
+							"result": map[string]interface{}{
+								"blockNumber": "0x1234",
+								"blockHash":   "0xabcdef",
+							},
+						},
+					}
+					notifBytes, _ := json.Marshal(notification)
+					conn.WriteMessage(websocket.TextMessage, notifBytes)
+				}()
+			} else {
+				// Echo other requests
+				response := TestRPCResponse{
+					ID:      req.ID,
+					Result:  "mock_result",
+					JSONRPC: "2.0",
+				}
+				respBytes, _ := json.Marshal(response)
+				conn.WriteMessage(messageType, respBytes)
+			}
+		}
+	}
+}
+
+func TestWebSocketProxyBasicConnection(t *testing.T) {
+	// Create mock backend WebSocket server
+	mockServer := NewMockWSServer()
+	defer mockServer.Close()
+
+	// Create proxy server configuration
+	config := &Config{
+		Debug:    true,
+		CacheTTL: time.Minute,
+		Port:     "0",
+		WSNodes:  []string{mockServer.URL()},
+	}
+
+	server := NewServer(config)
+
+	// Create test HTTP server for the proxy
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", server.enableCORS)
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Convert HTTP URL to WebSocket URL
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+
+	// Create WebSocket client connection to proxy
+	dialer := websocket.Dialer{}
+	conn, _, err := dialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send a test message
+	testReq := TestRPCRequest{
+		ID:      1,
+		Method:  "eth_blockNumber",
+		Params:  []interface{}{},
+		JSONRPC: "2.0",
+	}
+
+	reqBytes, err := json.Marshal(testReq)
+	require.NoError(t, err)
+
+	err = conn.WriteMessage(websocket.TextMessage, reqBytes)
+	require.NoError(t, err)
+
+	// Read response
+	messageType, message, err := conn.ReadMessage()
+	require.NoError(t, err)
+	assert.Equal(t, websocket.TextMessage, messageType)
+
+	var response TestRPCResponse
+	err = json.Unmarshal(message, &response)
+	require.NoError(t, err)
+	assert.Equal(t, 1, response.ID)
+	assert.Equal(t, "mock_result", response.Result)
+
+	// Verify message was received by backend
+	messages := mockServer.GetMessages()
+	assert.Len(t, messages, 1)
+
+	var receivedReq TestRPCRequest
+	err = json.Unmarshal(messages[0], &receivedReq)
+	require.NoError(t, err)
+	assert.Equal(t, "eth_blockNumber", receivedReq.Method)
+}
+
+func TestWebSocketProxyFailover(t *testing.T) {
+	// Create two mock backend servers
+	failingServer := NewMockWSServer()
+	failingServer.SetFail(true)
+	defer failingServer.Close()
+
+	workingServer := NewMockWSServer()
+	defer workingServer.Close()
+
+	// Create proxy server with failing server first
+	config := &Config{
+		Debug:    true,
+		CacheTTL: time.Minute,
+		Port:     "0",
+		WSNodes:  []string{failingServer.URL(), workingServer.URL()},
+	}
+
+	server := NewServer(config)
+
+	// Create test HTTP server for the proxy
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", server.enableCORS)
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Convert HTTP URL to WebSocket URL
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+
+	// Create WebSocket client connection to proxy
+	dialer := websocket.Dialer{}
+	conn, _, err := dialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send a test message - should connect to working server after failing server fails
+	testReq := TestRPCRequest{
+		ID:      1,
+		Method:  "eth_blockNumber",
+		Params:  []interface{}{},
+		JSONRPC: "2.0",
+	}
+
+	reqBytes, err := json.Marshal(testReq)
+	require.NoError(t, err)
+
+	err = conn.WriteMessage(websocket.TextMessage, reqBytes)
+	require.NoError(t, err)
+
+	// Read response
+	messageType, message, err := conn.ReadMessage()
+	require.NoError(t, err)
+	assert.Equal(t, websocket.TextMessage, messageType)
+
+	var response TestRPCResponse
+	err = json.Unmarshal(message, &response)
+	require.NoError(t, err)
+	assert.Equal(t, 1, response.ID)
+
+	// Verify message was received by working server
+	messages := workingServer.GetMessages()
+	assert.Len(t, messages, 1)
+}
+
+func TestWebSocketProxySubscription(t *testing.T) {
+	// Create mock backend WebSocket server
+	mockServer := NewMockWSServer()
+	defer mockServer.Close()
+
+	// Create proxy server configuration
+	config := &Config{
+		Debug:    true,
+		CacheTTL: time.Minute,
+		Port:     "0",
+		WSNodes:  []string{mockServer.URL()},
+	}
+
+	server := NewServer(config)
+
+	// Create test HTTP server for the proxy
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", server.enableCORS)
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Convert HTTP URL to WebSocket URL
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+
+	// Create WebSocket client connection to proxy
+	dialer := websocket.Dialer{}
+	conn, _, err := dialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send subscription request
+	subReq := TestRPCRequest{
+		ID:      1,
+		Method:  "eth_subscribe",
+		Params:  []interface{}{"newHeads"},
+		JSONRPC: "2.0",
+	}
+
+	reqBytes, err := json.Marshal(subReq)
+	require.NoError(t, err)
+
+	err = conn.WriteMessage(websocket.TextMessage, reqBytes)
+	require.NoError(t, err)
+
+	// Read subscription response
+	messageType, message, err := conn.ReadMessage()
+	require.NoError(t, err)
+	assert.Equal(t, websocket.TextMessage, messageType)
+
+	var subResponse TestRPCResponse
+	err = json.Unmarshal(message, &subResponse)
+	require.NoError(t, err)
+	assert.Equal(t, 1, subResponse.ID)
+	assert.NotNil(t, subResponse.Result)
+
+	// Read subscription notification
+	messageType, message, err = conn.ReadMessage()
+	require.NoError(t, err)
+	assert.Equal(t, websocket.TextMessage, messageType)
+
+	var notification map[string]interface{}
+	err = json.Unmarshal(message, &notification)
+	require.NoError(t, err)
+	assert.Equal(t, "eth_subscription", notification["method"])
+	assert.Contains(t, notification, "params")
+}
+
+func TestWebSocketProxySubscriptionFailover(t *testing.T) {
+	// Create two mock backend servers
+	server1 := NewMockWSServer()
+	defer server1.Close()
+
+	server2 := NewMockWSServer()
+	defer server2.Close()
+
+	// Create proxy server configuration
+	config := &Config{
+		Debug:    true,
+		CacheTTL: time.Minute,
+		Port:     "0",
+		WSNodes:  []string{server1.URL(), server2.URL()},
+	}
+
+	server := NewServer(config)
+
+	// Create test HTTP server for the proxy
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", server.enableCORS)
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Convert HTTP URL to WebSocket URL
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+
+	// Create WebSocket client connection to proxy
+	dialer := websocket.Dialer{}
+	conn, _, err := dialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send subscription request
+	subReq := TestRPCRequest{
+		ID:      1,
+		Method:  "eth_subscribe",
+		Params:  []interface{}{"newHeads"},
+		JSONRPC: "2.0",
+	}
+
+	reqBytes, err := json.Marshal(subReq)
+	require.NoError(t, err)
+
+	err = conn.WriteMessage(websocket.TextMessage, reqBytes)
+	require.NoError(t, err)
+
+	// Read subscription response
+	messageType, message, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.NotNil(t, messageType)
+	var subResponse TestRPCResponse
+	err = json.Unmarshal(message, &subResponse)
+	require.NoError(t, err)
+
+	// Read notification from first server
+	messageType, message, err = conn.ReadMessage()
+	require.NotNil(t, messageType)
+	require.NoError(t, err)
+
+	// Now make first server fail
+	server1.SetFail(true)
+	server1.Close() // Force disconnection
+
+	// Wait a bit for failover to occur
+	time.Sleep(500 * time.Millisecond)
+
+	// Send another message - should work after failover
+	testReq := TestRPCRequest{
+		ID:      2,
+		Method:  "eth_blockNumber",
+		Params:  []interface{}{},
+		JSONRPC: "2.0",
+	}
+
+	reqBytes2, err := json.Marshal(testReq)
+	require.NoError(t, err)
+
+	err = conn.WriteMessage(websocket.TextMessage, reqBytes2)
+	require.NoError(t, err)
+
+	// Should receive response from second server
+	messageType, message, err = conn.ReadMessage()
+	require.NoError(t, err)
+
+	var response TestRPCResponse
+	err = json.Unmarshal(message, &response)
+	require.NoError(t, err)
+	assert.Equal(t, 2, response.ID)
+
+	// Verify second server received messages (original subscription + new request)
+	messages := server2.GetMessages()
+	assert.GreaterOrEqual(t, len(messages), 1) // At least the re-established subscription
+}
+
+func TestWebSocketProxyAllNodesFail(t *testing.T) {
+	// Create failing mock servers
+	server1 := NewMockWSServer()
+	server1.SetFail(true)
+	defer server1.Close()
+
+	server2 := NewMockWSServer()
+	server2.SetFail(true)
+	defer server2.Close()
+
+	// Create proxy server configuration
+	config := &Config{
+		Debug:    true,
+		CacheTTL: time.Minute,
+		Port:     "0",
+		WSNodes:  []string{server1.URL(), server2.URL()},
+	}
+
+	server := NewServer(config)
+
+	// Create test HTTP server for the proxy
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", server.enableCORS)
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Convert HTTP URL to WebSocket URL
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+
+	// Try to create WebSocket client connection to proxy
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+	conn, resp, err := dialer.Dial(wsURL, nil)
+
+	// Connection should fail or close immediately
+	if err == nil {
+		defer conn.Close()
+		// If connection succeeds, it should close quickly due to backend failures
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _, readErr := conn.ReadMessage()
+		assert.Error(t, readErr) // Should get an error due to connection closure
+	} else {
+		// Connection should fail with appropriate error
+		assert.Error(t, err)
+		if resp != nil {
+			assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		}
+	}
+}
+
+func TestWebSocketProxyUnsubscribe(t *testing.T) {
+	// Create mock backend WebSocket server
+	mockServer := NewMockWSServer()
+	defer mockServer.Close()
+
+	// Create proxy server configuration
+	config := &Config{
+		Debug:    true,
+		CacheTTL: time.Minute,
+		Port:     "0",
+		WSNodes:  []string{mockServer.URL()},
+	}
+
+	server := NewServer(config)
+
+	// Create test HTTP server for the proxy
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", server.enableCORS)
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	// Convert HTTP URL to WebSocket URL
+	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+
+	// Create WebSocket client connection to proxy
+	dialer := websocket.Dialer{}
+	conn, _, err := dialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send subscription request
+	subReq := TestRPCRequest{
+		ID:      1,
+		Method:  "eth_subscribe",
+		Params:  []interface{}{"newHeads"},
+		JSONRPC: "2.0",
+	}
+
+	reqBytes, err := json.Marshal(subReq)
+	require.NoError(t, err)
+
+	err = conn.WriteMessage(websocket.TextMessage, reqBytes)
+	require.NoError(t, err)
+
+	// Read subscription response
+	messageType, message, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.NotNil(t, messageType)
+
+	var subResponse TestRPCResponse
+	err = json.Unmarshal(message, &subResponse)
+	require.NoError(t, err)
+	subscriptionID := subResponse.Result
+
+	// Send unsubscribe request
+	unsubReq := TestRPCRequest{
+		ID:      2,
+		Method:  "eth_unsubscribe",
+		Params:  []interface{}{subscriptionID},
+		JSONRPC: "2.0",
+	}
+
+	unsubBytes, err := json.Marshal(unsubReq)
+	require.NoError(t, err)
+
+	err = conn.WriteMessage(websocket.TextMessage, unsubBytes)
+	require.NoError(t, err)
+
+	// Read unsubscribe response
+	messageType, message, err = conn.ReadMessage()
+	require.NoError(t, err)
+
+	var unsubResponse TestRPCResponse
+	err = json.Unmarshal(message, &unsubResponse)
+	require.NoError(t, err)
+	assert.Equal(t, 2, unsubResponse.ID)
+
+	// Verify both subscription and unsubscription messages were sent to backend
+	messages := mockServer.GetMessages()
+	assert.GreaterOrEqual(t, len(messages), 2)
+}
+
+// Existing test helper functions and types...
 
 func startAnvilContainer(ctx context.Context, t *testing.T) (testcontainers.Container, string) {
 	req := testcontainers.ContainerRequest{
@@ -164,6 +720,8 @@ func waitForRPC(t *testing.T, endpoint string) {
 	t.Fatal("RPC endpoint did not become available")
 }
 
+// Existing RPC tests...
+
 func TestRPCProxyFailover(t *testing.T) {
 	ctx := context.Background()
 
@@ -184,9 +742,9 @@ func TestRPCProxyFailover(t *testing.T) {
 	server := NewServer(config)
 
 	req := TestRPCRequest{
-		ID:     1,
-		Method: "web3_clientVersion",
-		Params: []interface{}{},
+		ID:      1,
+		Method:  "web3_clientVersion",
+		Params:  []interface{}{},
 		JSONRPC: "2.0",
 	}
 
@@ -210,14 +768,12 @@ func TestRPCProxyFailover(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, response.ID)
-	// assert.NotNil(t, response.Result)
 
 	if response.Result == nil {
 		t.Log(response.Error)
 	}
 	require.NoError(t, err)
 
-	// Safe type assertion to avoid panic
 	if response.Result != nil {
 		if resultStr, ok := response.Result.(string); ok {
 			fmt.Println("Response:", response.Result)
@@ -248,9 +804,9 @@ func TestRPCProxyAllNodesFail(t *testing.T) {
 	server := NewServer(config)
 
 	req := TestRPCRequest{
-		ID:     1,
-		Method: "web3_clientVersion",
-		Params: []interface{}{},
+		ID:      1,
+		Method:  "web3_clientVersion",
+		Params:  []interface{}{},
 		JSONRPC: "2.0",
 	}
 
@@ -294,9 +850,9 @@ func TestRPCProxyCaching(t *testing.T) {
 	server := NewServer(config)
 
 	req := TestRPCRequest{
-		ID:     1,
-		Method: "web3_clientVersion",
-		Params: []interface{}{},
+		ID:      1,
+		Method:  "web3_clientVersion",
+		Params:  []interface{}{},
 		JSONRPC: "2.0",
 	}
 
@@ -407,15 +963,15 @@ func TestRPCProxyBatchRequest(t *testing.T) {
 
 	batchReq := []TestRPCRequest{
 		{
-			ID:     1,
-			Method: "web3_clientVersion",
-			Params: []interface{}{},
+			ID:      1,
+			Method:  "web3_clientVersion",
+			Params:  []interface{}{},
 			JSONRPC: "2.0",
 		},
 		{
-			ID:     2,
-			Method: "net_version",
-			Params: []interface{}{},
+			ID:      2,
+			Method:  "net_version",
+			Params:  []interface{}{},
 			JSONRPC: "2.0",
 		},
 	}
