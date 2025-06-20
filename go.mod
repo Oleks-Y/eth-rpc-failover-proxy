@@ -3,6 +3,7 @@ module eth-rpc-failover-proxy
 go 1.24.4
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/stretchr/testify v1.10.0
 	github.com/testcontainers/testcontainers-go v0.37.0
